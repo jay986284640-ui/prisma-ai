@@ -3,6 +3,12 @@
 All notable changes to this project will be documented in this file.
 See [Conventional Commits](https://conventionalcommits.org) for commit guidelines.
 
+## [5.3.6](https://github.com/weicanie/prisma-ai/compare/v5.3.5...v5.3.6) (2026-02-17)
+
+### Bug Fixes
+
+- **oss:** fix oss when using online ([6c71793](https://github.com/weicanie/prisma-ai/commit/6c717939c3554dfed783efe6168f585519feaa58))
+
 ## [5.3.5](https://github.com/weicanie/prisma-ai/compare/v5.3.4...v5.3.5) (2026-02-12)
 
 ### Bug Fixes
