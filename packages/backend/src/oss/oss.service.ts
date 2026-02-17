@@ -43,7 +43,7 @@ export class OssService {
 	 * @param bucketName 桶名
 	 * @returns 文件内容的Buffer
 	 */
-	async getObject(objectName: string, bucketName = 'prisma-ai'){
+	async getObject(objectName: string, bucketName = 'prisma-ai') {
 		try {
 			const dataStream = await this.ossClient.getObject(bucketName, objectName);
 			const chunks: Buffer[] = [];
@@ -66,6 +66,25 @@ export class OssService {
 	 */
 	async presignedPutObject(userId: string, name: string, bucketName = 'prisma-ai', expire = 3600) {
 		try {
+			if (process.env.IS_ONLINE) {
+				// 1. 使用预签名客户端生成 URL
+				let presignedUrl = await this.presignOssClient.presignedPutObject(
+					bucketName,
+					`${userId}/${name}`,
+					expire
+				);
+
+				// 2. 将内部 MinIO 地址替换为前端可访问的 Nginx 代理地址
+				// 内部地址可能是 http://minio-container:9000/... 或 http://nginx-container/... 取决于nginx设置的HOST
+				// 替换为前端可访问的 https://ai.pinkprisma.com/oss/...
+				// 使用正则匹配协议、主机和端口
+				presignedUrl = presignedUrl.replace(
+					/http:\/\/[^/]+/,
+					process.env.OSS_HOST_URL || 'https://ai.pinkprisma.com/oss'
+				);
+
+				return presignedUrl;
+			}
 			// 1. 使用预签名客户端（endpoint: 'nginx-container'）生成 URL
 			// 此时 URL 为 http://nginx-container/prisma-ai/...
 			let presignedUrl = await this.presignOssClient.presignedPutObject(

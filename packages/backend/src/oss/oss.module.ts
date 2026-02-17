@@ -28,6 +28,22 @@ import { OssService } from './oss.service';
 			provide: 'OSS-PRESIGN-CLIENT',
 			inject: [ConfigService],
 			async useFactory(configService: ConfigService) {
+				if (process.env.IS_ONLINE) {
+					const client = new Minio.Client({
+						// 用于后端与minio服务通信，不需要nginx代理
+						endPoint:
+							process.env.NODE_ENV === 'production'
+								? configService.get('OSS_ENDPOINT') || 'minio-container'
+								: 'localhost',
+						port: Number(configService.get('OSS_PORT')) || 9000,
+						useSSL: false,
+						accessKey: configService.get('OSS_ACCESSKEY'),
+						secretKey: configService.get('OSS_SECRETKEY'),
+						// 当通过子路径代理minio服务时，必须使用 path-style
+						pathStyle: true
+					});
+					return client;
+				}
 				const client = new Minio.Client({
 					//生产环境必须指向 Nginx 容器，因为它是内部通信的下一跳
 					endPoint: process.env.NODE_ENV === 'production' ? 'nginx-container' : 'localhost',
