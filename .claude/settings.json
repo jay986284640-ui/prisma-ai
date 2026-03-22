@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker restart:*)",
+      "Bash(sed -i 's/http:\\\\/\\\\/magic-resume:3009/http:\\\\/\\\\/localhost:3009/g' /opt/prisma-ai/nginx/conf/default.conf)",
+      "Bash(sed -i 's/http:\\\\/\\\\/minio-container:9000/http:\\\\/\\\\/localhost:9000/g' /opt/prisma-ai/nginx/conf/default.conf)"
+    ]
+  }
+}

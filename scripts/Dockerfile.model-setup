@@ -11,6 +11,8 @@ COPY ./requirements.txt .
 COPY ./model-onnx.sh .
 RUN chmod +x ./model-onnx.sh
 
+RUN pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+RUN pip install --upgrade pip
 # 安装依赖
 # 使用 --no-cache-dir 减小镜像体积
 # 使用 -i 指定清华大学的 PyPI 镜像源，以加速国内下载

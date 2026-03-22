@@ -74,6 +74,8 @@ export class CrawlQuestionService implements OnModuleDestroy {
 	// 用于HTML转Markdown的浏览器实例和页面
 	private browser: puppeteer.Browser | null = null;
 	private converterPage: puppeteer.Page | null = null;
+	// 标记是否正在处理断开连接，避免重复处理
+	private isDisconnecting = false;
 	// 本地缓存文件路径，用于中断恢复
 	private readonly cacheFilePath = path.join(process.cwd(), 'crawl_data/questions.json');
 
@@ -174,6 +176,9 @@ export class CrawlQuestionService implements OnModuleDestroy {
 
 				const newArticlesForCategory: CrawledArticle[] = [];
 				for (const url of urls) {
+					// 检查浏览器连接状态，必要时重新初始化
+					await this._ensureBrowserConnected(page);
+
 					// 过滤：如果详情已在缓存中，直接使用
 					if (cachedArticlesMap.has(url)) {
 						articlesToSave.push(cachedArticlesMap.get(url)!);
@@ -184,6 +189,11 @@ export class CrawlQuestionService implements OnModuleDestroy {
 					let rawData = await this._getQuestionDetails(page, url, category);
 					let retryCount = 0;
 					while (!rawData?.titleHtml || !rawData?.contentHtml) {
+						// 检查是否是浏览器断开导致的错误，尝试重连
+						if (retryCount > 0 && retryCount % 2 === 0) {
+							this.logger.warn('检测到可能的浏览器断开，正在尝试重新连接...');
+							await this._ensureBrowserConnected(page);
+						}
 						if (retryCount > 5) {
 							this.logger.warn(`重试5次后仍未能从 ${url} 提取到标题/内容, 跳过...`);
 							this.logger.debug(rawData);
@@ -273,11 +283,17 @@ export class CrawlQuestionService implements OnModuleDestroy {
 		| null
 	> {
 		try {
+			// 检查页面是否有效
+			if (!page || page.isClosed()) {
+				this.logger.warn(`页面已关闭，无法抓取: ${url}`);
+				return null;
+			}
+
 			await this._simulateHumanBehavior('detail');
 			await page.goto(url, { waitUntil: 'networkidle2' });
 
-			// 等待页面完全加载并进行初始的用户行为模拟
-			await page.waitForSelector('.answerBtn___3rwds', { timeout: 100000 });
+			// 带保活的等待 - 防止 browserless 超时断开
+			await this._waitForSelectorWithKeepAlive(page, '.answerBtn___3rwds', { timeout: 100000 });
 			await this._simulateUserInteraction(page);
 
 			// 更真实的点击模拟
@@ -288,7 +304,7 @@ export class CrawlQuestionService implements OnModuleDestroy {
 			}
 
 			// 等待答案内容加载
-			await page.waitForSelector('.detailBox___3lvLy', { timeout: 100000 });
+			await this._waitForSelectorWithKeepAlive(page, '.detailBox___3lvLy', { timeout: 100000 });
 
 			// 再次模拟用户交互，确保页面内容完全加载
 			await this._simulateUserInteraction(page);
@@ -385,7 +401,12 @@ export class CrawlQuestionService implements OnModuleDestroy {
 				gistHtml: extractedData.gistHtml
 			};
 		} catch (error) {
-			this.logger.error(`抓取题目详情失败: ${url}`, error.stack);
+			// 检查是否是 TargetCloseError（目标页面已关闭）
+			if (error instanceof Error && error.name === 'TargetCloseError') {
+				this.logger.warn(`页面连接已关闭，可能是浏览器超时或断开: ${url}`);
+			} else {
+				this.logger.error(`抓取题目详情失败: ${url}`, error.stack);
+			}
 			return null;
 		}
 	}
@@ -410,7 +431,9 @@ export class CrawlQuestionService implements OnModuleDestroy {
 					defaultViewport: {
 						width: 1366,
 						height: 768
-					}
+					},
+					// 增加协议超时时间到 5 分钟
+					protocolTimeout: 300000
 				});
 				this.logger.log('成功连接到远程浏览器。');
 			} catch (error) {
@@ -420,11 +443,13 @@ export class CrawlQuestionService implements OnModuleDestroy {
 		} else {
 			this.logger.log('未检测到远程浏览器端点，将启动本地 Puppeteer 实例。');
 			this.browser = await puppeteer.launch({
-				headless: false,
+				headless: true,
 				defaultViewport: {
 					width: 1366,
 					height: 768
 				},
+				// 增加协议超时时间到 5 分钟
+				protocolTimeout: 300000,
 				args: [
 					'--no-sandbox',
 					'--disable-setuid-sandbox',
@@ -438,9 +463,12 @@ export class CrawlQuestionService implements OnModuleDestroy {
 		}
 
 		this.browser.on('disconnected', () => {
+			if (this.isDisconnecting) return;
+			this.isDisconnecting = true;
 			this.logger.warn('浏览器连接已断开。');
 			this.browser = null;
 			this.converterPage = null;
+			this.isDisconnecting = false;
 		});
 
 		return this.browser;
@@ -515,6 +543,16 @@ export class CrawlQuestionService implements OnModuleDestroy {
 
 			let isLastPage = false;
 			while (!isLastPage) {
+				// 定期保活，防止 browserless 超时断开连接
+				if (this.browser && this.browser.isConnected()) {
+					try {
+						await page.evaluate(() => 1); // 简单的 CDP ping
+					} catch (e) {
+						this.logger.warn('CDP ping 失败，尝试重新连接...');
+						this.browser = await this._initializeBrowser();
+					}
+				}
+
 				const urlsOnPage = await page.evaluate(
 					domain =>
 						Array.from(document.querySelectorAll('.ant-list-items div a[href]')).map(
@@ -535,7 +573,8 @@ export class CrawlQuestionService implements OnModuleDestroy {
 					this.logger.log('点击下一页');
 					await nextButton.click();
 					await this._simulateHumanBehavior('list');
-					await page.waitForSelector('.ant-spin-spinning', { hidden: true, timeout: 100000 });
+					// 使用带保活的 waitForSelector，防止 browserless 超时断开
+					await this._waitForSelectorWithKeepAlive(page, '.ant-spin-spinning', { hidden: true, timeout: 100000 });
 				} else {
 					this.logger.log(`分类 "${category}" 已是最后一页`);
 					isLastPage = true;
@@ -647,7 +686,20 @@ export class CrawlQuestionService implements OnModuleDestroy {
 	 * @param html 题目详情页的HTML
 	 */
 	private async _htmlToMarkdown(html: string): Promise<string> {
-		if (!html || !this.converterPage) return '';
+		if (!html) return '';
+
+		try {
+			// 确保 converterPage 可用，必要时重新创建
+			await this._ensureConverterPage();
+		} catch (error) {
+			this.logger.warn('无法获取有效的 converterPage，返回空字符串');
+			return '';
+		}
+
+		if (!this.converterPage || this.converterPage.isClosed()) {
+			this.logger.warn('converterPage 已关闭，返回空字符串');
+			return '';
+		}
 
 		try {
 			// 步骤1：在每次转换前，先清空输出区域，确保不会读取到上一次的陈旧数据
@@ -684,8 +736,71 @@ export class CrawlQuestionService implements OnModuleDestroy {
 			return markdown;
 		} catch (error) {
 			this.logger.warn('HTML到Markdown转换失败或超时，返回空字符串');
+			// 重置 converterPage 以便下次使用
+			this.converterPage = null;
 			return '';
 		}
+	}
+
+	/**
+	 * 确保 converterPage 可用，必要时重新创建
+	 */
+	private async _ensureConverterPage(): Promise<void> {
+		if (this.converterPage && !this.converterPage.isClosed() && this.browser && this.browser.isConnected()) {
+			return;
+		}
+
+		this.logger.log('正在重新创建 converterPage...');
+
+		// 关闭旧页面（如果存在）
+		if (this.converterPage && !this.converterPage.isClosed()) {
+			try {
+				await this.converterPage.close();
+			} catch (e) {
+				// 忽略关闭错误
+			}
+		}
+
+		// 确保浏览器可用
+		if (!this.browser || !this.browser.isConnected()) {
+			this.logger.log('浏览器连接已断开，正在重新连接...');
+			this.browser = await this._initializeBrowser();
+		}
+
+		// 创建新页面
+		this.converterPage = await this.browser.newPage();
+
+		// 重新访问转换网站
+		try {
+			await this.converterPage.goto('https://htmlmarkdown.com/', { waitUntil: 'networkidle2' });
+		} catch (e) {
+			this.logger.error('无法访问 htmlmarkdown.com，请检查网络或网站状态');
+			throw e;
+		}
+	}
+
+	/**
+	 * 确保浏览器连接正常，必要时重新初始化
+	 * @param page 需要检查的页面，如果页面已关闭则重新创建
+	 */
+	private async _ensureBrowserConnected(page: puppeteer.Page): Promise<puppeteer.Page> {
+		// 检查浏览器是否连接
+		if (!this.browser || !this.browser.isConnected()) {
+			this.logger.warn('浏览器连接已断开，正在重新初始化...');
+			this.browser = await this._initializeBrowser();
+			this.converterPage = null; // 重置 converterPage，稍后会重新创建
+		}
+
+		// 检查页面是否有效
+		if (!page || page.isClosed()) {
+			this.logger.warn('页面已关闭，正在创建新页面...');
+			const newPage = await this.browser.newPage();
+			// 重新创建 converterPage
+			await this._ensureConverterPage();
+			return newPage;
+		}
+
+		return page;
 	}
 
 	private async _markdownNormalize(
@@ -923,6 +1038,50 @@ export class CrawlQuestionService implements OnModuleDestroy {
 			const y = Math.floor(Math.random() * viewport.height);
 			await page.mouse.move(x, y);
 		}
+	}
+
+	/**
+	 * 保活机制：在长时间等待期间定期发送 CDP 命令防止连接超时
+	 * @param page Puppeteer页面对象
+	 * @param originalTimeout 原始 waitForSelector 的超时时间（毫秒）
+	 */
+	private async _keepAliveWhileWaiting(page: puppeteer.Page, originalTimeout: number): Promise<void> {
+		const keepAliveInterval = 25000; // 每 25 秒发送一次保活命令（小于 30 秒超时）
+		const startTime = Date.now();
+		const elapsed = () => Date.now() - startTime;
+
+		// 只在原始超时时间内保活
+		while (elapsed() < originalTimeout) {
+			await new Promise(resolve => setTimeout(resolve, keepAliveInterval));
+			// 不要等待太靠近超时
+			if (elapsed() >= originalTimeout - 5000) break;
+
+			try {
+				if (page && !page.isClosed()) {
+					await page.evaluate(() => 1); // 简单的 CDP ping
+					this.logger.debug(`保活 ping 成功 (已运行 ${elapsed()}ms)`);
+				}
+			} catch (e) {
+				this.logger.warn('保活 ping 失败:', e);
+				break;
+			}
+		}
+	}
+
+	/**
+	 * 带保活的 waitForSelector
+	 */
+	private async _waitForSelectorWithKeepAlive(
+		page: puppeteer.Page,
+		selector: string,
+		options: { timeout?: number; hidden?: boolean } = {}
+	): Promise<void> {
+		const timeout = options.timeout || 30000;
+		// 同时启动等待和保活任务
+		await Promise.all([
+			page.waitForSelector(selector, options),
+			this._keepAliveWhileWaiting(page, timeout)
+		]);
 	}
 
 	/**

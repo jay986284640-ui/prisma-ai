@@ -4,9 +4,10 @@ services:
     image: docker.1ms.run/browserless/chrome:latest
     restart: unless-stopped
     container_name: browserless-chrome
-    # 如果需要在主机上进行调试，可以取消下面的端口注释
-    ports:
-      - '3123:3000'
+    network_mode: host
+    environment:
+      # 延长连接超时时间到 5 分钟（默认 60 秒）
+      - CONNECTION_TIMEOUT=300000
 
   prisma-ai-backend:
     image: docker.1ms.run/onlyie/prisma-ai-backend:latest
@@ -20,25 +21,25 @@ services:
         condition: service_healthy
       minio-container:
         condition: service_healthy
-      # 添加对 browserless-chrome 服务的依赖
-      browserless-chrome:
-        condition: service_started
     restart: unless-stopped
     container_name: backend
+    # 使用主机网络模式，直接访问主机上的 Chrome remote debugging
+    network_mode: host
     # 将指定的文件的环境变量加载到容器中
     env_file:
       - ./packages/backend/.env
       - ./packages/backend/.env.production
     environment:
       NODE_ENV: production
-      MONGO_HOST: mongo-container
-      # 覆盖env_file中的同名环境变量
-      DATABASE_URL: mysql://root:qwqw1314.@mysql-container:3306/prisma-ai
-      # 新增环境变量，指向 browserless 服务
-      PUPPETEER_BROWSER_WSE_ENDPOINT: ws://browserless-chrome:3000
-      DEEPWIKI_DOWN_URL: http://deepwiki-down:9009
-    ports:
-      - '3003:3003'
+      MONGO_HOST: localhost
+      # 覆盖env_file中的同名环境变量 - 使用 localhost 访问
+      DATABASE_URL: mysql://root:qwqw1314.@localhost:3306/prisma-ai
+      # 使用主机 Chrome remote debugging（network_mode: host 时用 localhost）
+      PUPPETEER_BROWSER_WSE_ENDPOINT: ws://localhost:9222/devtools/browser/20ea8818-58f7-45e0-b781-d823f98e1a84
+      PUPPETEER_EXECUTABLE_PATH: /usr/bin/google-chrome
+      DEEPWIKI_DOWN_URL: http://localhost:9009
+      REDIS_HOST: localhost
+      REDIS_PORT: 6379
     volumes:
       - ./docker-data/nest-app/logs:/app/packages/backend/logs
       - ./docker-data/nest-app/data_user_use/feedback_ai:/app/packages/backend/data_user_use/feedback_ai
@@ -49,42 +50,35 @@ services:
       - ./resumes:/app/resumes
       - ./project_wikis:/app/project_wikis
       - ./packages/backend/prisma_agent_config.json:/app/packages/backend/prisma_agent_config.json
+
   magic-resume-container:
     image: docker.1ms.run/onlyie/prisma-ai-resume-editor:latest
-    # build:
-    #   context: .
-    #   dockerfile: ./docker/magic-resume/Dockerfile.CI
-    ports:
-      - '3009:3009'
+    network_mode: host
     restart: unless-stopped
     container_name: magic-resume
+
   deepwiki-down:
     image: docker.1ms.run/onlyie/prisma-ai-deepwiki-down:latest
+    network_mode: host
     volumes:
       # docker run -v 需要处理windows兼容性
       - ./user_data:/user_data
     command: service --host 0.0.0.0 --port 9009
+
   nginx-container:
     image: docker.1ms.run/onlyie/prisma-ai-nginx:latest
-    ports:
-      - '80:80' # HTTP
-      # HTTPS (如需启用)
-      # - '443:443'
+    network_mode: host
     volumes:
       - ./nginx/logs:/var/log/nginx # Nginx 日志
       - ./nginx/conf/default.conf:/etc/nginx/conf.d/default.conf
-      # 如果启用 HTTPS，还需要
-      # - ./nginx/ssl:/etc/nginx/ssl
     restart: unless-stopped
     depends_on:
       - prisma-ai-backend
       - minio-container
+
   mysql-container:
     image: docker.1ms.run/library/mysql
-    #占用的主机端口:网络内访问使用的端口
-    ports:
-      - '3308:3306'
-      # 目录内不能有文件,否则报错
+    network_mode: host
     volumes:
       - ./docker-data/mysql:/var/lib/mysql
     environment:
@@ -99,10 +93,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
   redis-container:
     image: docker.1ms.run/library/redis
-    ports:
-      - '6377:6379'
+    network_mode: host
     volumes:
       - ./docker-data/redis:/data
     restart: unless-stopped
@@ -111,10 +105,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
   mongo-container:
     image: docker.1ms.run/library/mongo
-    ports:
-      - '27018:27017'
+    network_mode: host
     volumes:
       - ./docker-data/mongo:/data/db
     restart: unless-stopped
@@ -123,11 +117,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+
   minio-container:
     image: docker.1ms.run/bitnamilegacy/minio:2025.4.3
-    ports:
-      - '9003:9000'
-      - '9004:9001'
+    network_mode: host
     volumes:
       - ./docker-data/minio:/bitnami/minio/data
     restart: unless-stopped
@@ -142,4 +135,3 @@ services:
       MINIO_ROOT_PASSWORD: admin123.
       MINIO_DEFAULT_BUCKETS: prisma-ai
     command: server /bitnami/minio/data --console-address :9001
-#使用默认桥接网络
