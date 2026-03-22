@@ -3,7 +3,13 @@
     "allow": [
       "Bash(docker restart:*)",
       "Bash(sed -i 's/http:\\\\/\\\\/magic-resume:3009/http:\\\\/\\\\/localhost:3009/g' /opt/prisma-ai/nginx/conf/default.conf)",
-      "Bash(sed -i 's/http:\\\\/\\\\/minio-container:9000/http:\\\\/\\\\/localhost:9000/g' /opt/prisma-ai/nginx/conf/default.conf)"
+      "Bash(sed -i 's/http:\\\\/\\\\/minio-container:9000/http:\\\\/\\\\/localhost:9000/g' /opt/prisma-ai/nginx/conf/default.conf)",
+      "Bash(curl -s \"https://java.mid-life.vip/topic/06c34dab-9790-4627-8929-baa0e6fbec5b\")",
+      "Bash(docker cp:*)",
+      "Bash(curl -s \"https://minimax-algeng-chat-tts.oss-cn-wulanchabu.aliyuncs.com/ccv2%2F2026-03-22%2FMiniMax-M2.7%2F2035334576368259906%2F09d3ba28d94d9c90fda663f607f08cbffe1a36dc546dffbc6eb52561cae80810..png?Expires=1774274156&OSSAccessKeyId=LTAI5tGLnRTkBjLuYPjNcKQ8&Signature=hdb7jzrwDLYqoTc4XIdT0K1FP3Y%3D\" -o /tmp/detail.png)",
+      "Read(//tmp/**)",
+      "Bash(curl -s -o /tmp/detail2.png \"https://minimax-algeng-chat-tts.oss-cn-wulanchabu.aliyuncs.com/ccv2%2F2026-03-22%2FMiniMax-M2.7%2F2035334576368259906%2F09d3ba28d94d9c90fda663f607f08cbffe1a36dc546dffbc6eb52561cae80810..png?Expires=1774274156&OSSAccessKeyId=LTAI5tGLnRTkBjLuYPjNcKQ8&Signature=hdb7jzrwDLYqoTc4XIdT0K1FP3Y%3D\")",
+      "Bash(find /opt/prisma-ai/docker-data -name *.log)"
     ]
   }
 }

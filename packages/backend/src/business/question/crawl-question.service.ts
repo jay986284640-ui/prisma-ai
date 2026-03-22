@@ -137,14 +137,46 @@ export class CrawlQuestionService implements OnModuleDestroy {
 
 		// 统一初始化浏览器和页面
 		this.browser = await this._initializeBrowser();
+
+		// 先获取已有页面的 cookies（保持登录状态）
+		const existingPages = await this.browser.pages();
+		const cookies: puppeteer.CookieParam[] = [];
+		if (existingPages.length > 0) {
+			try {
+				const existingCookies = await existingPages[0].cookies();
+				cookies.push(...existingCookies);
+				this.logger.log(`从已有页面获取到 ${cookies.length} 个 cookies`);
+			} catch (e) {
+				this.logger.warn('获取 cookies 失败');
+			}
+		}
+
+		// 创建新页面并设置 cookies
 		const page = await this.browser.newPage();
+		if (cookies.length > 0) {
+			this.logger.log(`获取到的 cookies: ${JSON.stringify(cookies.map(c => ({ name: c.name, domain: c.domain, path: c.path })))}`);
+			await page.setCookie(...cookies);
+			this.logger.log(`已为新页面设置 ${cookies.length} 个 cookies`);
+			// 先访问列表页让 session 初始化
+			await page.goto('https://java.mid-life.vip/topic-list', { waitUntil: 'networkidle2' });
+			this.logger.log('已访问列表页初始化 session');
+		} else {
+			this.logger.warn('没有获取到 cookies，新页面可能未登录');
+		}
+
+		// converterPage 仍然需要是新页面
 		this.converterPage = await this.browser.newPage();
 
+		// 尝试访问 htmlmarkdown.com，增强重试机制
 		try {
-			await this.converterPage.goto('https://htmlmarkdown.com/', { waitUntil: 'networkidle2' });
+			await this.converterPage.goto('https://htmlmarkdown.com/', {
+				waitUntil: 'networkidle2',
+				timeout: 30000
+			});
 		} catch (e) {
-			this.logger.error('无法访问htmlmarkdown.com，请检查网络或网站状态');
-			throw e;
+			this.logger.warn(`无法访问htmlmarkdown.com: ${e.message}，将使用简单文本提取`);
+			// 不再直接抛出错误，允许继续执行（后续转换会使用简单方法）
+			this.converterPage = null;
 		}
 
 		try {
@@ -289,11 +321,60 @@ export class CrawlQuestionService implements OnModuleDestroy {
 				return null;
 			}
 
+			this.logger.log(`开始抓取题目: ${url}`);
+
 			await this._simulateHumanBehavior('detail');
 			await page.goto(url, { waitUntil: 'networkidle2' });
 
-			// 带保活的等待 - 防止 browserless 超时断开
-			await this._waitForSelectorWithKeepAlive(page, '.answerBtn___3rwds', { timeout: 100000 });
+			// 打印页面标题和 URL
+			const pageInfo = await page.evaluate(() => {
+				return {
+					title: document.title,
+					url: window.location.href,
+					bodyText: document.body?.innerText?.substring(0, 200) || '',
+					hasContent: document.querySelector('.detailBox___3lvLy') !== null,
+					hasLoginMsg: document.body?.innerText?.includes('登录后可看答案'),
+				};
+			});
+			this.logger.log(`页面信息: title=${pageInfo.title}, url=${pageInfo.url}`);
+			this.logger.log(`页面内容: ${pageInfo.bodyText.replace(/\n/g, ' ')}`);
+			this.logger.log(`是否有详情内容: ${pageInfo.hasContent}, 是否显示登录: ${pageInfo.hasLoginMsg}`);
+
+			// 立即检查是否是 VIP 无权限页面，避免等待超时
+			try {
+				await page.waitForSelector('.ant-result-title', { timeout: 3000 });
+				const resultTitle = await page.$eval('.ant-result-title', el => el.textContent);
+				if (resultTitle && resultTitle.includes('没有权限查看会员题库的答案')) {
+					this.logger.warn(`题目 ${url} 需要 VIP 权限，跳过`);
+					return null;
+				}
+			} catch (e) {
+				// 没有找到 .ant-result-title，说明页面正常，继续执行
+			}
+
+			// 等待按钮出现，但先尝试滚动到按钮位置确保可见
+			try {
+				const btnCheck = await page.evaluate(() => {
+					const btn = document.querySelector('.answerBtn___3rwds');
+					if (btn instanceof HTMLElement) {
+						btn.scrollIntoView({ behavior: 'instant', block: 'center' });
+						return {
+							exists: true,
+							visible: btn.offsetParent !== null,
+							display: window.getComputedStyle(btn).display,
+							rect: btn.getBoundingClientRect()
+						};
+					}
+					return { exists: false };
+				});
+				this.logger.log(`答案按钮检查: ${JSON.stringify(btnCheck)}`);
+				// 等待一小段时间让滚动完成
+				await new Promise(resolve => setTimeout(resolve, 500));
+			} catch (e) {
+				this.logger.warn('滚动到答案按钮位置失败');
+			}
+
+			// 按钮已确认存在，直接点击
 			await this._simulateUserInteraction(page);
 
 			// 更真实的点击模拟
@@ -389,6 +470,14 @@ export class CrawlQuestionService implements OnModuleDestroy {
 			const time_update = time_update_match
 				? new Date(time_update_match[0])
 				: new Date(time_create);
+
+			// 提取标题文本用于日志
+			const titleMatch = extractedData.titleHtml.match(/<span>([^<]+)<\/span>/);
+			const titlePreview = titleMatch ? titleMatch[1].substring(0, 30) : '未知标题';
+			const hasAnswer = extractedData.contentHtml.length > 0;
+			const hasGist = extractedData.gistHtml.length > 0;
+			this.logger.log(`题目抓取成功: ${titlePreview}... | 答案:${hasAnswer ? '有' : '无'} | 要点:${hasGist ? '有' : '无'}`);
+
 			return {
 				link: this._normalizeUrl(url),
 				content_type: this._normalizeCategory(category),
@@ -490,11 +579,6 @@ export class CrawlQuestionService implements OnModuleDestroy {
 		await this._simulateHumanBehavior('list');
 		await page.goto(listPageUrl, { waitUntil: 'networkidle2' });
 
-		// 为用户登录操作提供15秒的等待时间
-		this.logger.log('等待15秒以便用户手动登录...');
-		await new Promise(resolve => setTimeout(resolve, 15000));
-		this.logger.log('等待结束，继续执行爬虫任务。');
-
 		// 等待标签加载
 		await page.waitForSelector('.entryBox___1cUts span.ant-tag-checkable', { timeout: 100000 });
 		const allCategories = await page.evaluate(() =>
@@ -553,28 +637,58 @@ export class CrawlQuestionService implements OnModuleDestroy {
 					}
 				}
 
-				const urlsOnPage = await page.evaluate(
-					domain =>
-						Array.from(document.querySelectorAll('.ant-list-items div a[href]')).map(
-							a => `${domain}${a.getAttribute('href')}`
-						),
+				const urlsOnPageRaw = await page.evaluate(
+					domain => {
+						const links = Array.from(document.querySelectorAll('.ant-list-items div a[href]'));
+						return links.map(a => {
+							const href = a.getAttribute('href') || '';
+							return { href, domain };
+						});
+					},
 					domain
 				);
+				this.logger.log(`收集到的URL详情: ${JSON.stringify(urlsOnPageRaw.slice(0, 3))}`);
+
+				const urlsOnPage = urlsOnPageRaw.map((item: { href: string; domain: string }) => {
+					let href = item.href;
+					if (href.startsWith('//')) {
+						href = href.substring(1);
+					}
+					// 去掉 domain 尾部的斜杠，避免拼接时出现双斜杠
+					const domain = item.domain.replace(/\/$/, '');
+					return `${domain}${href}`;
+				});
 
 				for (const url of urlsOnPage) {
 					const normalizedUrl = this._normalizeUrl(url);
+					this.logger.log(`收集到URL: raw=${url}, normalized=${normalizedUrl}`);
 					if (!urlToCategoryMap.has(normalizedUrl)) {
 						urlToCategoryMap.set(normalizedUrl, this._normalizeCategory(category));
 					}
 				}
 
+				if (isLastPage) break;
+
 				const nextButton = await page.$('li.ant-pagination-next:not(.ant-pagination-disabled)');
 				if (nextButton) {
 					this.logger.log('点击下一页');
-					await nextButton.click();
+					try {
+						await nextButton.click();
+					} catch (e) {
+						// 点击超时，尝试使用 JavaScript 点击
+						this.logger.warn('按钮点击超时，尝试使用 JS 点击');
+						await page.evaluate(() => {
+							const btn = document.querySelector('li.ant-pagination-next:not(.ant-pagination-disabled)');
+							if (btn instanceof HTMLElement) btn.click();
+						});
+					}
 					await this._simulateHumanBehavior('list');
 					// 使用带保活的 waitForSelector，防止 browserless 超时断开
-					await this._waitForSelectorWithKeepAlive(page, '.ant-spin-spinning', { hidden: true, timeout: 100000 });
+					try {
+						await this._waitForSelectorWithKeepAlive(page, '.ant-spin-spinning', { hidden: true, timeout: 100000 });
+					} catch (e) {
+						this.logger.warn('等待 loading spinner 消失超时，继续执行');
+					}
 				} else {
 					this.logger.log(`分类 "${category}" 已是最后一页`);
 					isLastPage = true;
@@ -688,17 +802,18 @@ export class CrawlQuestionService implements OnModuleDestroy {
 	private async _htmlToMarkdown(html: string): Promise<string> {
 		if (!html) return '';
 
+		// 尝试使用 converterPage 转换
 		try {
 			// 确保 converterPage 可用，必要时重新创建
 			await this._ensureConverterPage();
 		} catch (error) {
-			this.logger.warn('无法获取有效的 converterPage，返回空字符串');
-			return '';
+			this.logger.warn('无法获取有效的 converterPage，使用简单文本提取');
+			return this._simpleHtmlToText(html);
 		}
 
 		if (!this.converterPage || this.converterPage.isClosed()) {
-			this.logger.warn('converterPage 已关闭，返回空字符串');
-			return '';
+			this.logger.warn('converterPage 已关闭，使用简单文本提取');
+			return this._simpleHtmlToText(html);
 		}
 
 		try {
@@ -777,6 +892,69 @@ export class CrawlQuestionService implements OnModuleDestroy {
 			this.logger.error('无法访问 htmlmarkdown.com，请检查网络或网站状态');
 			throw e;
 		}
+	}
+
+	/**
+	 * 简单的HTML转文本方法（备用方案）
+	 * @param html HTML内容
+	 */
+	private _simpleHtmlToText(html: string): string {
+		if (!html) return '';
+
+		// 移除script和style标签
+		let text = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+		text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+
+		// 替换常见的HTML标签为markdown格式
+		text = text.replace(/<br\s*\/?>/gi, '\n');
+		text = text.replace(/<\/p>/gi, '\n\n');
+		text = text.replace(/<\/div>/gi, '\n');
+		text = text.replace(/<\/li>/gi, '\n');
+
+		// 处理代码块
+		text = text.replace(/<pre[^>]*><code[^>]*>/gi, '```\n');
+		text = text.replace(/<\/code><\/pre>/gi, '\n```');
+
+		// 处理行内代码
+		text = text.replace(/<code[^>]*>/gi, '`');
+		text = text.replace(/<\/code>/gi, '`');
+
+		// 处理加粗和斜体
+		text = text.replace(/<strong[^>]*>/gi, '**');
+		text = text.replace(/<\/strong>/gi, '**');
+		text = text.replace(/<b[^>]*>/gi, '**');
+		text = text.replace(/<\/b>/gi, '**');
+		text = text.replace(/<em[^>]*>/gi, '*');
+		text = text.replace(/<\/em>/gi, '*');
+		text = text.replace(/<i[^>]*>/gi, '*');
+		text = text.replace(/<\/i>/gi, '*');
+
+		// 处理链接
+		text = text.replace(/<a[^>]*href=["']([^"']*)["'][^>]*>([^<]*)<\/a>/gi, '[$2]($1)');
+
+		// 处理图片
+		text = text.replace(/<img[^>]*src=["']([^"']*)["'][^>]*alt=["']([^"']*)["'][^>]*\/?>/gi, '![$2]($1)');
+		text = text.replace(/<img[^>]*alt=["']([^"']*)["'][^>]*src=["']([^"']*)["'][^>]*\/?>/gi, '![$1]($2)');
+		text = text.replace(/<img[^>]*src=["']([^"']*)["'][^>]*\/?>/gi, '![]($1)');
+
+		// 移除所有其他HTML标签
+		text = text.replace(/<[^>]+>/g, '');
+
+		// 解码HTML实体
+		text = text.replace(/&nbsp;/g, ' ');
+		text = text.replace(/&lt;/g, '<');
+		text = text.replace(/&gt;/g, '>');
+		text = text.replace(/&amp;/g, '&');
+		text = text.replace(/&quot;/g, '"');
+		text = text.replace(/&#39;/g, "'");
+		text = text.replace(/&nbsp;/g, ' ');
+
+		// 清理多余的空白
+		text = text.replace(/[ \t]+/g, ' ');
+		text = text.replace(/\n\n+/g, '\n\n');
+		text = text.trim();
+
+		return text;
 	}
 
 	/**
@@ -953,7 +1131,9 @@ export class CrawlQuestionService implements OnModuleDestroy {
 	 */
 	private _normalizeUrl(url: string): string {
 		try {
-			const urlObj = new URL(url);
+			// 处理双斜杠问题
+			let fixedUrl = url.replace(/^\/\//, '/');
+			const urlObj = new URL(fixedUrl);
 			return `${urlObj.origin}${urlObj.pathname}`;
 		} catch (error) {
 			this.logger.warn(`无效的URL格式，无法标准化: ${url}`);
